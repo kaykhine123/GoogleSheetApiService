@@ -315,24 +315,21 @@ public class GoogleSheetApiService {
 		return sheetDataGetUrl;
 	}
 
-	public void outputCsvForAllData(OauthCredentials credentials, String tableName, Boolean isTSV)
-			throws BusinessLogicException {
+	public void exportTableToCsv(OauthCredentials credentials, String tableName, boolean isTSV)
+			throws BusinessLogicException, ParseException {
 		String accessToken = this.getAccessToken(credentials);
-		Map<String, String> spreadsheetData;
+		List<JsonObject> spreadsheetFiles = fetchMatchingSpreadsheetFiles(accessToken, tableName);
 
-		List<JsonObject> spreadsheetFiles = getAllSpreadsheetFiles(accessToken, tableName);
-
-		if (spreadsheetFiles.size() > 0) {
-			spreadsheetData = getFilteredSpreadsheetData(tableName, spreadsheetFiles, accessToken);
-		} else {
-			spreadsheetData = getFirstSpreadsheetData(tableName, spreadsheetFiles);
+		if (spreadsheetFiles.isEmpty()) {
+			throw new BusinessLogicException("No spreadsheets found for table: " + tableName);
 		}
 
-		writeCsvForSpreadsheetData(tableName, spreadsheetData, accessToken, isTSV);
+		Map<String, String> spreadsheetInfo = extractSpreadsheetInfo(tableName, spreadsheetFiles);
+		writeCsvFromSpreadsheet(spreadsheetInfo, accessToken, isTSV, tableName);
 	}
 
-	private List<JsonObject> getAllSpreadsheetFiles(String accessToken, String tableName)
-			throws BusinessLogicException {
+	private List<JsonObject> fetchMatchingSpreadsheetFiles(String accessToken, String tablePrefix)
+			throws BusinessLogicException, ParseException {
 		List<JsonObject> spreadsheetFiles = new ArrayList<>();
 		final HttpGet request = new HttpGet(GoogleSheetURLs.GOOGLE_DRIVE_FILES_URL);
 		request.setHeader("Authorization", "Bearer " + accessToken);
@@ -346,7 +343,7 @@ public class GoogleSheetApiService {
 				Optional<JsonArray> files = Optional.ofNullable(responseJson.getAsJsonArray("files"));
 				files.ifPresent(jsonFiles -> jsonFiles.forEach(file -> {
 					Optional<JsonElement> name = Optional.ofNullable(file.getAsJsonObject().get("name"));
-					name.map(JsonElement::getAsString).filter(tableName::startsWith)
+					name.map(JsonElement::getAsString).filter(tablePrefix::startsWith)
 							.ifPresent(fileName -> spreadsheetFiles.add(file.getAsJsonObject()));
 				}));
 			} else {
@@ -360,70 +357,74 @@ public class GoogleSheetApiService {
 		return spreadsheetFiles;
 	}
 
-	private Map<String, String> getFirstSpreadsheetData(String tableName, List<JsonObject> spreadsheetFiles) {
-		Map<String, String> filteredSpreadsheetData = new HashMap<>();
-		filteredSpreadsheetData.put("spreadsheetId", spreadsheetFiles.get(0).get("id").getAsString());
-		filteredSpreadsheetData.put("sheet",
-				tableName.replaceFirst(spreadsheetFiles.get(0).get("name").getAsString() + "_", ""));
+	private Map<String, String> extractSpreadsheetInfo(String tableName, List<JsonObject> spreadsheetFiles) {
+		JsonObject spreadsheet = spreadsheetFiles.get(0);
+		String fileId = spreadsheet.get("id").getAsString();
+		String sheetName = tableName.replaceFirst(spreadsheet.get("name").getAsString() + "_", "");
 
-		return filteredSpreadsheetData;
+		Map<String, String> info = new HashMap<>();
+		info.put("spreadsheetId", fileId);
+		info.put("sheet", sheetName);
+		return info;
 	}
 
-	private static void writeCsvForSpreadsheetData(String tableName, Map<String, String> spreadsheetData,
-			String accessToken, Boolean isTSV) throws BusinessLogicException {
-		String sheetDataGetUrl = String.format(GoogleSheetURLs.SHEET_ALL_DATA_GET_URL,
-				spreadsheetData.get("spreadsheetId"), spreadsheetData.get("sheet"));
-		final HttpGet sheetDataGetRequest = new HttpGet(sheetDataGetUrl);
-		sheetDataGetRequest.setHeader("Authorization", "Bearer " + accessToken);
+	// === CSV Writer ===
+
+	private void writeCsvFromSpreadsheet(Map<String, String> spreadsheetInfo, String accessToken, boolean isTSV,
+			String tableName) throws BusinessLogicException, ParseException {
+		String url = String.format(GoogleSheetURLs.SHEET_ALL_DATA_GET_URL, spreadsheetInfo.get("spreadsheetId"),
+				spreadsheetInfo.get("sheet"));
+		HttpGet request = new HttpGet(url);
+		request.setHeader("Authorization", "Bearer " + accessToken);
 
 		try (CloseableHttpClient httpClient = HttpClients.createDefault();
-				CloseableHttpResponse response = httpClient.execute(sheetDataGetRequest);) {
+				CloseableHttpResponse response = httpClient.execute(request)) {
+
 			String responseString = EntityUtils.toString(response.getEntity());
-			JsonObject responseJson = JsonParser.parseString(responseString).getAsJsonObject();
-			Optional<JsonArray> values = Optional.ofNullable(responseJson.getAsJsonArray("values"));
+			JsonObject json = JsonParser.parseString(responseString).getAsJsonObject();
+			JsonArray values = json.getAsJsonArray("values");
 
-			if (values.isPresent()) {
-				Gson gson = new Gson();
-				Type type = new TypeToken<List<String>>() {
-				}.getType();
-
-				if (isTSV) {
-					try (Writer fileWriter = new FileWriter(getCsvOutputFileName(tableName));
-							CSVWriter writer = new CSVWriter(fileWriter, '\t', CSVWriter.NO_QUOTE_CHARACTER,
-									CSVWriter.DEFAULT_ESCAPE_CHARACTER, CSVWriter.DEFAULT_LINE_END)) {
-
-						values.get().forEach(value -> {
-							JsonArray jsonArray = value.getAsJsonArray();
-							List<String> row = gson.fromJson(jsonArray, type);
-							writer.writeNext(row.toArray(new String[0]));
-						});
-
-					}
-				} else {
-					try (CSVWriter writer = new CSVWriter(new FileWriter(getCsvOutputFileName(tableName)))) {
-						values.get().forEach(value -> {
-							writer.writeNext(gson.fromJson(value.getAsJsonArray(), type));
-						});
-					}
-				}
+			if (values == null) {
+				throw new BusinessLogicException("No data returned for sheet.");
 			}
-		} catch (Exception e) {
-			throw new BusinessLogicException("Failed to sheet data", e);
+
+			writeCsvFile(values, isTSV, tableName);
+
+		} catch (IOException e) {
+			throw new BusinessLogicException("Failed to read sheet data", e);
 		}
 	}
 
-	private static String getCsvOutputFileName(String tableName) {
-		String baseDir = "D:\\DataX\\csvs\\testing\\";
-		String baseName = tableName;
-		String extension = ".csv";
-		int counter = 0;
-		String fileName;
+	private void writeCsvFile(JsonArray rows, boolean isTSV, String tableName) throws IOException {
+		Gson gson = new Gson();
+		Type listType = new TypeToken<List<String>>() {
+		}.getType();
+		String outputPath = generateUniqueCsvPath(tableName, isTSV);
+
+		try (Writer writer = new FileWriter(outputPath);
+				CSVWriter csvWriter = new CSVWriter(writer, isTSV ? '\t' : CSVWriter.DEFAULT_SEPARATOR,
+						CSVWriter.NO_QUOTE_CHARACTER, CSVWriter.DEFAULT_ESCAPE_CHARACTER, CSVWriter.DEFAULT_LINE_END)) {
+
+			for (JsonElement rowElement : rows) {
+				JsonArray rowArray = rowElement.getAsJsonArray();
+				List<String> row = gson.fromJson(rowArray, listType);
+				csvWriter.writeNext(row.toArray(new String[0]));
+			}
+		}
+	}
+
+	private String generateUniqueCsvPath(String tableName, boolean isTSV) {
+		final String baseDir = "D:\\DataX\\csvs\\testing\\";
+		final String extension = isTSV ? ".tsv" : ".csv";
+		int index = 0;
+		String filePath;
 
 		do {
-			fileName = baseName + (counter == 0 ? "" : "(" + counter + ")") + extension;
-			counter++;
-		} while (Files.exists(Paths.get(baseDir + fileName)));
+			String suffix = (index == 0) ? "" : "(" + index + ")";
+			filePath = baseDir + tableName + suffix + extension;
+			index++;
+		} while (Files.exists(Paths.get(filePath)));
 
-		return baseDir + fileName;
+		return filePath;
 	}
 }

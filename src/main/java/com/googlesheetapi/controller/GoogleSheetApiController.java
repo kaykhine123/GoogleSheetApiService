@@ -3,6 +3,7 @@ package com.googlesheetapi.controller;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hc.core5.http.ParseException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -56,8 +57,8 @@ public class GoogleSheetApiController {
 
 	@GetMapping("/outputCsvForAllData")
 	public ResponseEntity<String> outputCsvForAllData(@RequestParam String tableName,
-			@RequestParam(defaultValue = "false") Boolean isTSV) throws BusinessLogicException {
-		gsApiService.outputCsvForAllData(credentials, tableName, isTSV);
+			@RequestParam(defaultValue = "false") Boolean isTSV) throws BusinessLogicException, ParseException {
+		gsApiService.exportTableToCsv(credentials, tableName, isTSV);
 		return ResponseEntity.ok("Row inserted successfully");
 	}
 }
